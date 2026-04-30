@@ -178,7 +178,12 @@ class ZYClient:
         if not self._client or not self._cookies_file:
             return
         async with self._persist_lock:
-            current = {name: str(value) for name, value in self._client.cookies.items()}
+            # httpx.Cookies keys by (name, domain, path); iter via the underlying
+            # CookieJar so a server-rotated cookie (with a Domain attribute) wins
+            # over the original domain-less set_cookies value.
+            current: dict[str, str] = {}
+            for cookie in self._client.cookies.jar:
+                current[cookie.name] = cookie.value
             marker = self._client.headers.get(_AUTH_MARKER_HEADER)
             payload = dict(current)
             if marker:
