@@ -284,8 +284,19 @@ class ZYClient:
         return f"{self._base_url}/cart"
 
     async def is_authenticated(self) -> bool:
+        # Probe getTicker for favoritesProducts: it 403s for anon clients and
+        # 200s for authenticated ones. /user/info/full needs a Bearer token GA
+        # serves separately from cookies, so it 401s even on a valid session.
+        assert self._client, "Call start() first"
+        params: dict[str, Any] = {
+            "locale": "ru",
+            "pageType": "favoritesProducts",
+            "moduleType": "customer",
+        }
+        if self._city_id:
+            params["cityId"] = self._city_id
         try:
-            info = await self.get_user_info()
-            return bool(info.get("id"))
+            resp = await self._client.get("/front/api/ticker/getTicker", params=params)
         except Exception:
             return False
+        return resp.status_code == 200
