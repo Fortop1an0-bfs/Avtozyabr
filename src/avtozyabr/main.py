@@ -42,7 +42,7 @@ async def run() -> None:
     log.info("db.pool_ready")
 
     # ── ZY HTTP client ────────────────────────────────────────────────────────
-    client = ZYClient(cfg.zy_base_url, cookies_file=cfg.zy_cookies_file)
+    client = ZYClient(cfg.zy_base_url, cookies_file=cfg.zy_cookies_file, city_id=cfg.zy_city_id)
     await client.start()
 
     auth_ok = await client.is_authenticated()

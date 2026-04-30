@@ -38,9 +38,11 @@ class Settings(BaseSettings):
             return [int(x) for x in v]
         return [int(x.strip()) for x in str(v).split(",") if x.strip()]
 
-    # ── Zolotoe Yabloko ───────────────────────────────────────────────────────
-    zy_base_url: str = "https://zolotoyabloko.ru"
+    # ── Goldapple ─────────────────────────────────────────────────────────────
+    zy_base_url: str = "https://goldapple.ru"
     zy_cookies_file: Path | None = None
+    # cityId from cart URL (fiasId param) — Vladivostok default
+    zy_city_id: str = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
 
     # ── Polling ───────────────────────────────────────────────────────────────
     poll_interval_normal: int = 300   # seconds

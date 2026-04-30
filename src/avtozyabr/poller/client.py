@@ -1,17 +1,16 @@
 """
-Async HTTP client for Zolotoe Yabloko.
+Async HTTP client for goldapple.ru
 
-Strategy:
-  1. Try direct httpx calls with stored cookies/headers.
-  2. On 403/captcha, fall back to Playwright browser automation.
-
-All requests go through ZYClient which manages session state.
+Real endpoints discovered via DevTools on 2026-04-30:
+  - Profile:   GET /front/api/user/info/full?locale=ru
+  - Wishlist:  GET /front/api/ticker/getTicker?locale=ru&pageType=favoritesProducts&moduleType=customer&cityId=...
+  - Cart GET:  GET /front/api/cart?locale=ru&forceCreate=false&fiasId=...&isPlaid=true&cartBeautiesStore=true
+  - Cart POST: POST /front/api/cart  (TODO: intercept from DevTools when adding item)
+  - Stock:     bundled inside wishlist/plp response (no separate stock endpoint found yet)
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,6 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 log = structlog.get_logger(__name__)
 
-# Headers that mimic a real Chrome browser on Windows
 _BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -44,17 +42,15 @@ class AuthError(Exception):
 
 
 class ZYClient:
-    """
-    Thin async wrapper around the ZY internal API.
-
-    Cookies can be loaded from:
-      - a Netscape-format cookie file (exported from browser)
-      - explicitly via set_cookies()
-    """
-
-    def __init__(self, base_url: str, cookies_file: Path | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        cookies_file: Path | None = None,
+        city_id: str = "",
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._cookies_file = cookies_file
+        self._city_id = city_id
         self._client: httpx.AsyncClient | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -78,7 +74,6 @@ class ZYClient:
     # ── Cookie management ─────────────────────────────────────────────────────
 
     def _load_cookies_from_file(self) -> dict[str, str]:
-        """Parse Netscape cookie file into a simple name→value dict."""
         path = self._cookies_file
         if not path or not path.exists():
             log.warning("zy_client.cookies_file_missing", path=str(path))
@@ -99,13 +94,10 @@ class ZYClient:
                 self._client.cookies.set(name, value)
 
     def export_cookies(self) -> dict[str, str]:
-        if not self._client:
-            return {}
-        return dict(self._client.cookies)
+        return dict(self._client.cookies) if self._client else {}
 
     # ── Low-level request ─────────────────────────────────────────────────────
 
-    # Only retry on network/connection errors — never on 4xx/5xx HTTP responses
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -134,50 +126,74 @@ class ZYClient:
         resp.raise_for_status()
         return resp
 
-    # ── ZY API endpoints ──────────────────────────────────────────────────────
+    # ── goldapple.ru API endpoints ────────────────────────────────────────────
+
+    async def get_user_info(self) -> dict[str, Any]:
+        """Returns profile: id, firstName, phone, city, discount, etc."""
+        resp = await self._get("/front/api/user/info/full", params={"locale": "ru"})
+        return resp.json().get("data", {})
 
     async def get_wishlist(self) -> list[dict[str, Any]]:
         """
-        Fetch wishlist items from the account.
-
-        Returns raw API payload; parsing happens in wishlist.py.
-        Endpoint discovered via DevTools — adjust if ZY changes API version.
+        Fetch favourites product list.
+        Response: {"data": {"data": [...]}}  — list of product objects.
         """
-        resp = await self._get("/api/v1/wishlist")
-        data = resp.json()
-        # Typical response: {"data": {"items": [...]}} — handle both shapes
-        if isinstance(data, list):
-            return data
-        items = data.get("data", data).get("items", data.get("data", []))
-        if isinstance(items, list):
-            return items
-        return []
-
-    async def get_product_stock(self, product_id: int) -> dict[str, Any]:
-        """Fetch stock/availability info for a single product."""
-        resp = await self._get(f"/api/v1/products/{product_id}/stock")
-        return resp.json()
-
-    async def add_to_cart(self, variant_id: int, qty: int = 1) -> dict[str, Any]:
-        """Add a product variant to the shopping cart."""
-        resp = await self._post(
-            "/api/v1/cart/items",
-            json={"variantId": variant_id, "quantity": qty},
-        )
-        return resp.json()
+        params: dict[str, Any] = {
+            "locale": "ru",
+            "pageType": "favoritesProducts",
+            "moduleType": "customer",
+        }
+        if self._city_id:
+            params["cityId"] = self._city_id
+        resp = await self._get("/front/api/ticker/getTicker", params=params)
+        outer = resp.json()
+        items = outer.get("data", {}).get("data", [])
+        return items if isinstance(items, list) else []
 
     async def get_cart(self) -> dict[str, Any]:
-        resp = await self._get("/api/v1/cart")
-        return resp.json()
+        """Returns full cart with items, totals, quote_id."""
+        params: dict[str, Any] = {
+            "locale": "ru",
+            "forceCreate": "false",
+            "isPlaid": "true",
+            "cartBeautiesStore": "true",
+        }
+        if self._city_id:
+            params["fiasId"] = self._city_id
+        resp = await self._get("/front/api/cart", params=params)
+        return resp.json().get("data", {})
+
+    async def get_product_stock(self, product_id: int) -> dict[str, Any]:
+        """
+        Stock info for a single product.
+        TODO: find the real stock endpoint from DevTools (intercept product page XHR).
+        Fallback: re-use cart data or wishlist item fields.
+        """
+        resp = await self._get(
+            f"/front/api/products/{product_id}",
+            params={"locale": "ru"},
+        )
+        return resp.json().get("data", {})
+
+    async def add_to_cart(self, product_id: int, qty: int = 1) -> dict[str, Any]:
+        """
+        Add item to cart.
+        TODO: intercept the real POST from DevTools when clicking 'В корзину'.
+        Current best guess based on Magento-style goldapple backend.
+        """
+        resp = await self._post(
+            "/front/api/cart",
+            params={"locale": "ru"},
+            json={"productId": product_id, "qty": qty},
+        )
+        return resp.json().get("data", {})
 
     async def get_checkout_url(self) -> str:
-        """Return a deep-link URL to the checkout page for use in TG button."""
         return f"{self._base_url}/cart"
 
     async def is_authenticated(self) -> bool:
-        """Probe the profile endpoint to verify session validity."""
         try:
-            await self._get("/api/v1/profile")
-            return True
+            info = await self.get_user_info()
+            return bool(info.get("id"))
         except Exception:
             return False
