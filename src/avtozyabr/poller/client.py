@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 log = structlog.get_logger(__name__)
 
@@ -105,7 +105,12 @@ class ZYClient:
 
     # ── Low-level request ─────────────────────────────────────────────────────
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    # Only retry on network/connection errors — never on 4xx/5xx HTTP responses
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)),
+    )
     async def _get(self, path: str, **kwargs: Any) -> httpx.Response:
         assert self._client, "Call start() first"
         resp = await self._client.get(path, **kwargs)
@@ -115,7 +120,11 @@ class ZYClient:
         resp.raise_for_status()
         return resp
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)),
+    )
     async def _post(self, path: str, **kwargs: Any) -> httpx.Response:
         assert self._client, "Call start() first"
         resp = await self._client.post(path, **kwargs)
@@ -170,5 +179,5 @@ class ZYClient:
         try:
             await self._get("/api/v1/profile")
             return True
-        except (AuthError, httpx.HTTPStatusError):
+        except Exception:
             return False
