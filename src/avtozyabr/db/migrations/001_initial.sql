@@ -44,9 +44,11 @@ CREATE TABLE IF NOT EXISTS order_attempts (
     external_order_id TEXT,
     price_at_order    NUMERIC(10,2),
     error             TEXT,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- prevent duplicate orders for same product+variant within the same day
-    UNIQUE (product_id, variant_id, date_trunc('day', triggered_at))
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Expressions in UNIQUE constraints require a separate index in PostgreSQL
+CREATE UNIQUE INDEX IF NOT EXISTS idx_order_attempts_no_dup
+    ON order_attempts (product_id, variant_id, date_trunc('day', triggered_at));
 
 CREATE INDEX IF NOT EXISTS idx_order_attempts_status ON order_attempts (status, updated_at DESC);
