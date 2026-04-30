@@ -11,7 +11,9 @@ Real endpoints discovered via DevTools on 2026-04-30:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +64,10 @@ class ZYClient:
         self._cookies_file = Path(cookies_file) if cookies_file else None
         self._city_id = city_id
         self._client: httpx.AsyncClient | None = None
+        # Snapshot of last payload written to disk; used to skip no-op writes.
+        self._last_persisted: dict[str, str] = {}
+        # Serialize concurrent persists from parallel scheduler jobs.
+        self._persist_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -78,6 +84,12 @@ class ZYClient:
             follow_redirects=True,
             timeout=httpx.Timeout(30.0),
         )
+        # Seed _last_persisted with what's already on disk so the first request
+        # only writes if GA actually rotated something.
+        snapshot = dict(cookies)
+        if marker:
+            snapshot[_AUTH_MARKER_KEY] = marker
+        self._last_persisted = snapshot
         log.info(
             "zy_client.started",
             base_url=self._base_url,
@@ -86,6 +98,11 @@ class ZYClient:
         )
 
     async def close(self) -> None:
+        # Final flush so any in-memory cookie deltas survive shutdown.
+        try:
+            await self._persist_live_state()
+        except Exception as exc:
+            log.warning("zy_client.persist_on_close_failed", error=str(exc))
         if self._client:
             await self._client.aclose()
 
@@ -141,8 +158,35 @@ class ZYClient:
         if marker:
             payload[_AUTH_MARKER_KEY] = marker
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Atomic write: tmp + rename, so a SIGKILL mid-write can't truncate the file.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
         log.info("zy_client.cookies_persisted", path=str(target), count=len(cookies))
+
+    async def _persist_live_state(self) -> None:
+        """
+        Write current in-memory cookies + auth marker back to disk if anything
+        changed since last persist. GA rotates anti-bot tokens (gsscw/cfidsw/__zzatw)
+        on each response; without this, a restart reverts the session to the
+        challenge already burnt by the previous run → 403.
+        """
+        if not self._client or not self._cookies_file:
+            return
+        async with self._persist_lock:
+            current = {name: str(value) for name, value in self._client.cookies.items()}
+            marker = self._client.headers.get(_AUTH_MARKER_HEADER)
+            payload = dict(current)
+            if marker:
+                payload[_AUTH_MARKER_KEY] = str(marker)
+            if payload == self._last_persisted:
+                return
+            self._save_cookies_to_file(current, str(marker) if marker else None)
+            self._last_persisted = payload
 
     def set_cookies(self, cookies: dict[str, str], persist: bool = True) -> bool:
         """
@@ -162,6 +206,11 @@ class ZYClient:
                 self._client.headers[_AUTH_MARKER_HEADER] = str(marker)
         if persist and self._cookies_file:
             self._save_cookies_to_file(local, marker)
+            # Sync snapshot so the next live-persist doesn't rewrite identical content.
+            snapshot = dict(local)
+            if marker:
+                snapshot[_AUTH_MARKER_KEY] = marker
+            self._last_persisted = snapshot
             return True
         return False
 
@@ -199,6 +248,7 @@ class ZYClient:
         resp = await self._client.get(path, **kwargs)
         log.debug("zy_client.get", path=path, status=resp.status_code)
         self._check_status(resp, path)
+        await self._persist_live_state()
         return resp
 
     @retry(**_RETRY_KWARGS)
@@ -207,6 +257,7 @@ class ZYClient:
         resp = await self._client.post(path, **kwargs)
         log.debug("zy_client.post", path=path, status=resp.status_code)
         self._check_status(resp, path)
+        await self._persist_live_state()
         return resp
 
     # ── goldapple.ru API endpoints ────────────────────────────────────────────
@@ -299,4 +350,8 @@ class ZYClient:
             resp = await self._client.get("/front/api/ticker/getTicker", params=params)
         except Exception:
             return False
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            # Capture rotated anti-bot cookies from this probe response.
+            await self._persist_live_state()
+            return True
+        return False

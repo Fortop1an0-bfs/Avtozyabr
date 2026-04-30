@@ -228,3 +228,59 @@ async def test_is_authenticated_returns_false_on_403(client: ZYClient, httpx_moc
 async def test_is_authenticated_returns_false_on_401(client: ZYClient, httpx_mock):
     httpx_mock.add_response(url=_TICKER_RE, status_code=401)
     assert await client.is_authenticated() is False
+
+
+# ── Cookie rotation persistence ───────────────────────────────────────────────
+
+
+async def test_rotated_cookies_persist_to_disk(client: ZYClient, tmp_path: Path, httpx_mock):
+    """Server rotates an anti-bot cookie via Set-Cookie; next restart must use the new value."""
+    client.set_cookies({"sessionid": "old", "gsscw-goldapple": "challenge_v1"})
+    httpx_mock.add_response(
+        url=re.compile(r"https://goldapple\.ru/front/api/cart\?.*"),
+        json={"data": {}},
+        headers=[
+            ("set-cookie", "gsscw-goldapple=challenge_v2; Path=/; Domain=goldapple.ru"),
+            ("set-cookie", "fgsscw-goldapple=fresh_token; Path=/; Domain=goldapple.ru"),
+        ],
+    )
+    await client.get_cart()
+
+    persisted = json.loads((tmp_path / "zy_cookies.json").read_text(encoding="utf-8"))
+    assert persisted["gsscw-goldapple"] == "challenge_v2"
+    assert persisted["fgsscw-goldapple"] == "fresh_token"
+    assert persisted["sessionid"] == "old"
+
+
+async def test_no_persist_when_cookies_unchanged(client: ZYClient, tmp_path: Path, httpx_mock):
+    """No-op writes are skipped — important since persist runs after every successful request."""
+    client.set_cookies({"sessionid": "stable"})
+    cookies_file = tmp_path / "zy_cookies.json"
+    mtime_before = cookies_file.stat().st_mtime_ns
+
+    httpx_mock.add_response(
+        url=re.compile(r"https://goldapple\.ru/front/api/cart\?.*"),
+        json={"data": {}},
+    )
+    await client.get_cart()
+
+    assert cookies_file.stat().st_mtime_ns == mtime_before
+
+
+async def test_persist_on_close_flushes_pending_changes(tmp_path: Path, httpx_mock):
+    """Cookies set in memory but never seen by a successful request still survive shutdown."""
+    cookies_file = tmp_path / "zy_cookies.json"
+    cookies_file.write_text(json.dumps({"sessionid": "initial"}), encoding="utf-8")
+
+    c = ZYClient(
+        base_url="https://goldapple.ru",
+        cookies_file=cookies_file,
+        city_id="city-id",
+    )
+    await c.start()
+    # Simulate cookie set by httpx internals (e.g. mid-request) without a successful 2xx.
+    c._client.cookies.set("sessionid", "rotated_in_flight")
+    await c.close()
+
+    persisted = json.loads(cookies_file.read_text(encoding="utf-8"))
+    assert persisted["sessionid"] == "rotated_in_flight"
