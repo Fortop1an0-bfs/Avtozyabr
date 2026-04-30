@@ -199,7 +199,7 @@ async def cmd_setrule(message: Message) -> None:
         await conn.execute(
             """
             INSERT INTO auto_order_rules (product_id, max_price, require_confirm, enabled)
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, COALESCE($3, TRUE), COALESCE($4, TRUE))
             ON CONFLICT (product_id) DO UPDATE
                 SET max_price = COALESCE($2, auto_order_rules.max_price),
                     require_confirm = COALESCE($3, auto_order_rules.require_confirm),
@@ -238,14 +238,14 @@ async def cmd_kill(message: Message) -> None:
     _state["paused"][0] = True
     if pool:
         async with pool.acquire() as conn:
-            cancelled = await conn.fetchval(
+            rows = await conn.fetch(
                 """
                 UPDATE order_attempts SET status = 'cancelled', updated_at = now()
                 WHERE status IN ('pending','cart_added','awaiting_confirm')
-                RETURNING COUNT(*)
+                RETURNING id
                 """
             )
-        await message.answer(f"🛑 Стоп. Поллинг остановлен, отменено заказов: {cancelled or 0}")
+        await message.answer(f"🛑 Стоп. Поллинг остановлен, отменено заказов: {len(rows)}")
     else:
         await message.answer("🛑 Поллинг остановлен")
 
@@ -270,12 +270,16 @@ async def cmd_setcookies(message: Message) -> None:
         return
     try:
         cookies = json.loads(text[1])
-        client.set_cookies(cookies)
+        if not isinstance(cookies, dict):
+            await message.answer("❌ JSON должен быть объектом {name: value, ...}")
+            return
+        persisted = client.set_cookies(cookies)
         ok = await client.is_authenticated()
+        persist_note = "💾 сохранено на диск" if persisted else "⚠️ НЕ сохранено (нет ZY_COOKIES_FILE)"
         if ok:
-            await message.answer("✅ Cookies приняты, авторизация OK")
+            await message.answer(f"✅ Cookies приняты, авторизация OK\n{persist_note}")
         else:
-            await message.answer("⚠️ Cookies приняты, но авторизация НЕ прошла — проверьте значения")
+            await message.answer(f"⚠️ Cookies приняты, но авторизация НЕ прошла — проверьте значения\n{persist_note}")
     except json.JSONDecodeError:
         await message.answer("❌ Невалидный JSON")
 

@@ -2,15 +2,16 @@
 Async HTTP client for goldapple.ru
 
 Real endpoints discovered via DevTools on 2026-04-30:
-  - Profile:   GET /front/api/user/info/full?locale=ru
-  - Wishlist:  GET /front/api/ticker/getTicker?locale=ru&pageType=favoritesProducts&moduleType=customer&cityId=...
-  - Cart GET:  GET /front/api/cart?locale=ru&forceCreate=false&fiasId=...&isPlaid=true&cartBeautiesStore=true
-  - Cart POST: POST /front/api/cart  (TODO: intercept from DevTools when adding item)
-  - Stock:     bundled inside wishlist/plp response (no separate stock endpoint found yet)
+  - Profile:   GET  /front/api/user/info/full?locale=ru
+  - Wishlist:  GET  /front/api/ticker/getTicker?locale=ru&pageType=favoritesProducts&moduleType=customer&cityId=...
+  - Cart GET:  GET  /front/api/cart?locale=ru&forceCreate=false&fiasId=...&isPlaid=true&cartBeautiesStore=true
+  - Cart ADD:  POST /front/api/cart/item?locale=ru   body: {sku, fiasId, isPlaid, cartBeautiesStore, ...}
+  - Stock:     no dedicated endpoint confirmed yet — wishlist/cart payloads carry availability
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,18 @@ _BASE_HEADERS = {
     ),
 }
 
+# Header name used by goldapple frontend for an auth marker computed in JS.
+# If user supplies it via /setcookies JSON under this key, it is promoted to a header.
+_AUTH_MARKER_KEY = "x_auth_marker"
+_AUTH_MARKER_HEADER = "X-Auth-Marker"
+
 
 class AuthError(Exception):
-    """Raised when session is expired or cookies are invalid."""
+    """Raised when session is expired or cookies are invalid (HTTP 401)."""
+
+
+class RetryableHTTPError(Exception):
+    """Raised on 429/5xx responses to trigger tenacity backoff."""
 
 
 class ZYClient:
@@ -49,23 +59,31 @@ class ZYClient:
         city_id: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._cookies_file = cookies_file
+        self._cookies_file = Path(cookies_file) if cookies_file else None
         self._city_id = city_id
         self._client: httpx.AsyncClient | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        cookies = self._load_cookies_from_file() if self._cookies_file else {}
+        cookies, marker = self._load_cookies_from_file()
+        headers = dict(_BASE_HEADERS)
+        if marker:
+            headers[_AUTH_MARKER_HEADER] = marker
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
-            headers=_BASE_HEADERS,
+            headers=headers,
             cookies=cookies,
             http2=True,
             follow_redirects=True,
             timeout=httpx.Timeout(30.0),
         )
-        log.info("zy_client.started", base_url=self._base_url, has_cookies=bool(cookies))
+        log.info(
+            "zy_client.started",
+            base_url=self._base_url,
+            has_cookies=bool(cookies),
+            has_auth_marker=bool(marker),
+        )
 
     async def close(self) -> None:
         if self._client:
@@ -73,57 +91,122 @@ class ZYClient:
 
     # ── Cookie management ─────────────────────────────────────────────────────
 
-    def _load_cookies_from_file(self) -> dict[str, str]:
+    def _load_cookies_from_file(self) -> tuple[dict[str, str], str | None]:
+        """
+        Load cookies from `cookies_file`. Format auto-detected:
+          - .json  → flat object {name: value, ..., x_auth_marker?: "..."}
+          - .txt   → Netscape (7 tab-separated columns; cols 5+6 are name/value)
+        Returns (cookies, x_auth_marker).
+        """
         path = self._cookies_file
         if not path or not path.exists():
-            log.warning("zy_client.cookies_file_missing", path=str(path))
-            return {}
-        cookies: dict[str, str] = {}
-        for line in path.read_text().splitlines():
-            if line.startswith("#") or not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                cookies[parts[5]] = parts[6]
-        log.info("zy_client.cookies_loaded", count=len(cookies))
-        return cookies
+            log.warning("zy_client.cookies_file_missing", path=str(path) if path else None)
+            return {}, None
 
-    def set_cookies(self, cookies: dict[str, str]) -> None:
+        text = path.read_text(encoding="utf-8")
+        marker: str | None = None
+
+        if path.suffix.lower() == ".json":
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                log.error("zy_client.cookies_json_invalid", path=str(path), error=str(exc))
+                return {}, None
+            if not isinstance(data, dict):
+                log.error("zy_client.cookies_json_not_object", path=str(path))
+                return {}, None
+            marker = data.pop(_AUTH_MARKER_KEY, None)
+            cookies = {str(k): str(v) for k, v in data.items()}
+        else:
+            cookies = {}
+            for line in text.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[parts[5]] = parts[6]
+
+        log.info("zy_client.cookies_loaded", count=len(cookies), format=path.suffix)
+        return cookies, marker
+
+    def _save_cookies_to_file(self, cookies: dict[str, str], marker: str | None) -> None:
+        """Persist cookies (+optional auth marker) as JSON for restart-survival."""
+        if not self._cookies_file:
+            return
+        path = self._cookies_file
+        # Always write JSON regardless of configured extension — JSON is the canonical
+        # interchange format used by /setcookies. Loader tolerates both formats.
+        target = path if path.suffix.lower() == ".json" else path.with_suffix(".json")
+        payload: dict[str, str] = dict(cookies)
+        if marker:
+            payload[_AUTH_MARKER_KEY] = marker
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("zy_client.cookies_persisted", path=str(target), count=len(cookies))
+
+    def set_cookies(self, cookies: dict[str, str], persist: bool = True) -> bool:
+        """
+        Apply cookies to the live client. If `cookies` contains the special
+        `x_auth_marker` key, it becomes the X-Auth-Marker header instead.
+        With persist=True, the same payload is written to cookies_file so a
+        container restart does not lose the session. Returns True if persistence
+        actually wrote a file, False otherwise.
+        """
+        # Don't mutate caller's dict
+        local = dict(cookies)
+        marker = local.pop(_AUTH_MARKER_KEY, None)
         if self._client:
-            for name, value in cookies.items():
-                self._client.cookies.set(name, value)
+            for name, value in local.items():
+                self._client.cookies.set(name, str(value))
+            if marker:
+                self._client.headers[_AUTH_MARKER_HEADER] = str(marker)
+        if persist and self._cookies_file:
+            self._save_cookies_to_file(local, marker)
+            return True
+        return False
 
     def export_cookies(self) -> dict[str, str]:
         return dict(self._client.cookies) if self._client else {}
 
     # ── Low-level request ─────────────────────────────────────────────────────
 
-    @retry(
+    _RETRY_KWARGS = dict(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)),
+        retry=retry_if_exception_type(
+            (
+                httpx.ConnectError,
+                httpx.TimeoutException,
+                httpx.RemoteProtocolError,
+                RetryableHTTPError,
+            )
+        ),
+        reraise=True,
     )
+
+    @staticmethod
+    def _check_status(resp: httpx.Response, path: str) -> None:
+        if resp.status_code == 401:
+            raise AuthError(f"Session expired (401) for {path}")
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            raise RetryableHTTPError(f"{resp.status_code} for {path}")
+        # 403 is treated as a hard failure (auth/bot-detection); do not retry.
+        resp.raise_for_status()
+
+    @retry(**_RETRY_KWARGS)
     async def _get(self, path: str, **kwargs: Any) -> httpx.Response:
         assert self._client, "Call start() first"
         resp = await self._client.get(path, **kwargs)
         log.debug("zy_client.get", path=path, status=resp.status_code)
-        if resp.status_code == 401:
-            raise AuthError(f"Session expired (401) for {path}")
-        resp.raise_for_status()
+        self._check_status(resp, path)
         return resp
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)),
-    )
+    @retry(**_RETRY_KWARGS)
     async def _post(self, path: str, **kwargs: Any) -> httpx.Response:
         assert self._client, "Call start() first"
         resp = await self._client.post(path, **kwargs)
         log.debug("zy_client.post", path=path, status=resp.status_code)
-        if resp.status_code == 401:
-            raise AuthError(f"Session expired (401) for {path}")
-        resp.raise_for_status()
+        self._check_status(resp, path)
         return resp
 
     # ── goldapple.ru API endpoints ────────────────────────────────────────────
@@ -166,8 +249,8 @@ class ZYClient:
     async def get_product_stock(self, product_id: int) -> dict[str, Any]:
         """
         Stock info for a single product.
-        TODO: find the real stock endpoint from DevTools (intercept product page XHR).
-        Fallback: re-use cart data or wishlist item fields.
+        TODO: dedicated endpoint not yet captured. Wishlist payload already carries
+        per-item availability; consider extracting from there to avoid a second hop.
         """
         resp = await self._get(
             f"/front/api/products/{product_id}",
@@ -175,16 +258,25 @@ class ZYClient:
         )
         return resp.json().get("data", {})
 
-    async def add_to_cart(self, product_id: int, qty: int = 1) -> dict[str, Any]:
+    async def add_to_cart(self, sku: str | int, qty: int = 1) -> dict[str, Any]:
         """
-        Add item to cart.
-        TODO: intercept the real POST from DevTools when clicking 'В корзину'.
-        Current best guess based on Magento-style goldapple backend.
+        Add item to cart. Captured request:
+          POST /front/api/cart/item?locale=ru
+          { sku, fiasId, isPlaid, cartBeautiesStore, ... }
+        Returns the new cart payload (data.cart.sections[].items[]).
         """
+        body: dict[str, Any] = {
+            "sku": str(sku),
+            "fiasId": self._city_id,
+            "isPlaid": True,
+            "cartBeautiesStore": True,
+        }
+        if qty > 1:
+            body["qty"] = qty
         resp = await self._post(
-            "/front/api/cart",
+            "/front/api/cart/item",
             params={"locale": "ru"},
-            json={"productId": product_id, "qty": qty},
+            json=body,
         )
         return resp.json().get("data", {})
 

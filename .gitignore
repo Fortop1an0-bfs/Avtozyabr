@@ -17,10 +17,11 @@ data/
 # Docker
 .dockerignore
 
-# IDE
+# IDE / agent
 .vscode/
 .idea/
 *.swp
+.claude/
 
 # Tests
 .pytest_cache/

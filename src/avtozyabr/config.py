@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # ── Goldapple ─────────────────────────────────────────────────────────────
     zy_base_url: str = "https://goldapple.ru"
     zy_cookies_file: Path | None = None
-    # cityId from cart URL (fiasId param) — Vladivostok default
+    # FIAS UUID used as both cityId (wishlist) and fiasId (cart). Default: Moscow.
     zy_city_id: str = "0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
 
     # ── Polling ───────────────────────────────────────────────────────────────
