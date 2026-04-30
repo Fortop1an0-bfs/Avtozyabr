@@ -38,7 +38,7 @@ async def _already_ordered_today(
         SELECT 1 FROM order_attempts
         WHERE product_id = $1
           AND variant_id = $2
-          AND date_trunc('day', triggered_at) = date_trunc('day', now())
+          AND order_date = CURRENT_DATE
           AND status NOT IN ('failed', 'cancelled')
         LIMIT 1
         """,
@@ -52,7 +52,7 @@ async def _daily_spend_today(conn: asyncpg.Connection) -> Decimal:
         """
         SELECT COALESCE(SUM(price_at_order), 0)
         FROM order_attempts
-        WHERE date_trunc('day', triggered_at) = date_trunc('day', now())
+        WHERE order_date = CURRENT_DATE
           AND status IN ('confirmed', 'paid')
         """
     )
@@ -68,9 +68,9 @@ async def _create_attempt(
     row = await conn.fetchrow(
         """
         INSERT INTO order_attempts
-            (product_id, variant_id, triggered_at, status, price_at_order)
-        VALUES ($1, $2, now(), 'pending', $3)
-        ON CONFLICT (product_id, variant_id, date_trunc('day', triggered_at))
+            (product_id, variant_id, triggered_at, order_date, status, price_at_order)
+        VALUES ($1, $2, now(), CURRENT_DATE, 'pending', $3)
+        ON CONFLICT (product_id, variant_id, order_date)
         DO NOTHING
         RETURNING id
         """,

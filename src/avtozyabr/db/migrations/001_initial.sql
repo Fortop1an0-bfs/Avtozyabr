@@ -38,17 +38,15 @@ CREATE TABLE IF NOT EXISTS order_attempts (
     product_id        BIGINT      NOT NULL REFERENCES wishlist_items(product_id),
     variant_id        BIGINT,
     triggered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    order_date        DATE        NOT NULL DEFAULT CURRENT_DATE,
     -- pending | cart_added | awaiting_confirm | confirmed | paid | failed | cancelled
     status            TEXT        NOT NULL DEFAULT 'pending',
     telegram_msg_id   BIGINT,
     external_order_id TEXT,
     price_at_order    NUMERIC(10,2),
     error             TEXT,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (product_id, variant_id, order_date)
 );
-
--- Expressions in UNIQUE constraints require a separate index in PostgreSQL
-CREATE UNIQUE INDEX IF NOT EXISTS idx_order_attempts_no_dup
-    ON order_attempts (product_id, variant_id, date_trunc('day', triggered_at));
 
 CREATE INDEX IF NOT EXISTS idx_order_attempts_status ON order_attempts (status, updated_at DESC);
