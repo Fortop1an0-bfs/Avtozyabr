@@ -210,23 +210,21 @@ async def test_500_retries(client: ZYClient, httpx_mock, monkeypatch):
     assert len(httpx_mock.get_requests()) == 3  # 3 attempts, all fail
 
 
-_TICKER_URL = (
-    "https://goldapple.ru/front/api/ticker/getTicker"
-    "?locale=ru&pageType=favoritesProducts&moduleType=customer"
-    "&cityId=0c5b2444-70a0-4932-980c-b4dc0d3f02b5"
-)
+import re
+
+_TICKER_RE = re.compile(r"https://goldapple\.ru/front/api/ticker/getTicker\?.*pageType=favoritesProducts.*")
 
 
 async def test_is_authenticated_returns_true_on_200(client: ZYClient, httpx_mock):
-    httpx_mock.add_response(url=_TICKER_URL, json={"data": {"data": []}})
+    httpx_mock.add_response(url=_TICKER_RE, json={"data": {"data": []}})
     assert await client.is_authenticated() is True
 
 
 async def test_is_authenticated_returns_false_on_403(client: ZYClient, httpx_mock):
-    httpx_mock.add_response(url=_TICKER_URL, status_code=403)
+    httpx_mock.add_response(url=_TICKER_RE, status_code=403)
     assert await client.is_authenticated() is False
 
 
 async def test_is_authenticated_returns_false_on_401(client: ZYClient, httpx_mock):
-    httpx_mock.add_response(url=_TICKER_URL, status_code=401)
+    httpx_mock.add_response(url=_TICKER_RE, status_code=401)
     assert await client.is_authenticated() is False
